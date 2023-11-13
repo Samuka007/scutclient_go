@@ -1,4 +1,4 @@
-package rjsocks
+package 
 
 import (
 	"bytes"
@@ -6,10 +6,10 @@ import (
 	"encoding/binary"
 	"net"
 
-	"github.com/google/gopacket/layers"
+	layers "github.com/google/gopacket/layers"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/pcap"
+	gopacket "github.com/google/gopacket"
+	pcap "github.com/google/gopacket/pcap"
 )
 
 var (
