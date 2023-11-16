@@ -98,11 +98,20 @@ func (h *Handle) SendLogoffPkt() error {
 }
 
 func (h *Handle) SendStartPkt() error {
+	if h.dstMacAddr == nil {
+		h.dstMacAddr = MultiCastAddr
+	} else if h.dstMacAddr[1] == 0xff {
+		h.dstMacAddr = MultiCastAddr
+	} else if h.dstMacAddr[1] == 0x80 {
+		h.dstMacAddr = BroadcastAddr
+	}
+
 	eth := layers.Ethernet{
 		SrcMAC:       h.srcMacAddr,
 		DstMAC:       h.dstMacAddr,
 		EthernetType: layers.EthernetTypeEAPOL,
 	}
+	
 	eapol := layers.EAPOL{
 		Version: 0x01,
 		Type:    layers.EAPOLTypeStart,

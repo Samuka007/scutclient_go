@@ -2,6 +2,7 @@ package scutclient_go
 
 import (
 	"encoding/binary"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -49,11 +50,17 @@ type Service struct {
 	handle          *Handle
 	echoNo, echoKey uint32
 	advertising     string
-	chanPkt         chan gopacket.Packet
+	// 8021x auth pkts
+	pkt8021x        chan gopacket.Packet
+	// udp auth pkts
+	pktUdp			chan gopacket.Packet
+	// global pkts
+	// chanPkts		chan gopacket.Packet
 	threadLock      sync.Mutex
 	crontab         *Crontab
 	isClosed        bool
 	isStopped       bool
+	logOffBefore	bool
 }
 
 func NewService(usr, pass, dev, adap string) (*Service, error) {
@@ -81,13 +88,14 @@ func NewService(usr, pass, dev, adap string) (*Service, error) {
 	}, nil
 }
 
-func (s *Service) packets() (<-chan gopacket.Packet, error) {
-	if s.chanPkt != nil {
-		return s.chanPkt, nil
+// Ethernet Type packets
+func (s *Service) packets8021x() (<-chan gopacket.Packet, error) {
+	if s.pkt8021x != nil {
+		return s.pkt8021x, nil
 	}
-	s.chanPkt = make(chan gopacket.Packet, 1000)
+	s.pkt8021x = make(chan gopacket.Packet, 1000)
 	go func() {
-		defer close(s.chanPkt)
+		defer close(s.pkt8021x)
 		src := gopacket.NewPacketSource(s.handle.PcapHandle, layers.LayerTypeEthernet)
 		in := src.Packets()
 		for packet := range in {
@@ -98,23 +106,89 @@ func (s *Service) packets() (<-chan gopacket.Packet, error) {
 			if pkt == nil {
 				continue
 			}
-			s.chanPkt <- packet
+			s.pkt8021x <- packet
 		}
 	}()
-	return s.chanPkt, nil
+	return s.pkt8021x, nil
 }
 
-func (s *Service) Run() error {
-	s.threadLock.Lock()
-	defer s.threadLock.Unlock()
-	go s.crontab.Run()
-	s.crontab.ForceRegister("Monitor", NewCronItem(func() { log.Printf("detect inactive core services, sending start packet\n"); s.handle.SendStartPkt() }, 40*time.Second))
-	in, err := s.packets()
+func (s *Service) packetsUdp() (<-chan gopacket.Packet, error) {
+	if s.pktUdp != nil {
+		return s.pktUdp, nil
+	}
+	s.pktUdp = make(chan gopacket.Packet, 1000)
+	go func() {
+		defer close(s.pktUdp)
+		src := gopacket.NewPacketSource(s.handle.PcapHandle, layers.LayerTypeUDP)
+		in := src.Packets()
+		for packet := range in {
+			if s.isClosed {
+				break
+			}
+			pkt := packet.Layer(layers.LayerTypeUDP)
+			if pkt == nil {
+				continue
+			}
+			s.pktUdp <- packet
+		}
+	}()
+	return s.pktUdp, nil
+}
+
+func (s *Service) handler8021x( packet gopacket.Packet ) error {
+	if s.isClosed {
+		return nil
+	}
+	if s.isStopped {
+		s.crontab.UpdateLastAccess("Echo", time.Now())
+		s.crontab.UpdateLastAccess("Monitor", time.Now())
+	}
+	eap := packet.Layer(layers.LayerTypeEAP).(*layers.EAP)
+	switch eap.Code {
+	case layers.EAPCodeRequest:
+		switch eap.Type {
+		case layers.EAPTypeIdentity:
+			s.updateStat(SrvStatRespIdentity)
+			eth := packet.Layer(layers.LayerTypeEthernet).(*layers.Ethernet)
+			s.handle.SetDstMacAddr(eth.SrcMAC)
+			// if err := s.handle.SendResponseIdentity(eap.Id, s.user); err != nil {
+			// 	return err
+			// }
+			log.Printf("response identity '%s' to [%s] with id=%d\n", s.user, s.handle.dstMacAddr, eap.Id)
+		case layers.EAPTypeOTP:
+			s.updateStat(SrvStatRespMd5Chall)
+			if len(eap.TypeData) >= 17 {
+				// seed := eap.TypeData[1:17]
+				// if err := s.handle.SendResponseMD5Chall(eap.Id, seed, s.user, s.pass); err != nil {
+				// 	return err
+				// }
+				// log.Printf("response md5-challange with seed=%v\n", seed)
+			}
+		}
+	case layers.EAPCodeSuccess:
+		s.updateStat(SrvStatSuccess)
+		// 
+	// case layers.EAPCodeFailure:
+	// 	// 平方退避 0 1 4 9 16 25...
+	// 	s.updateStat(SrvStatFailure)
+	// 	interval := time.Duration(failcount*failcount) * time.Second
+	// 	failcount++
+	// 	log.Printf("Login failed, sorry. Next try on %vs\n", interval)
+	// 	s.crontab.Delete("Echo")
+	// 	time.Sleep(interval)
+	// 	if err := s.handle.SendStartPkt(); err != nil {
+	// 		return err
+	// 	}
+	}
+	return nil
+}
+
+func (s *Service) handle8021x() error {
+	in, err := s.packets8021x()
+	failcount := int64(0)
 	if err != nil {
 		return err
 	}
-	failcount := int64(0)
-	s.handle.SendStartPkt()
 	for packet := range in {
 		if s.isClosed {
 			break
@@ -132,50 +206,29 @@ func (s *Service) Run() error {
 				s.updateStat(SrvStatRespIdentity)
 				eth := packet.Layer(layers.LayerTypeEthernet).(*layers.Ethernet)
 				s.handle.SetDstMacAddr(eth.SrcMAC)
-				if err := s.handle.SendResponseIdentity(eap.Id, s.user); err != nil {
-					return err
-				}
+				// if err := s.handle.SendResponseIdentity(eap.Id, s.user); err != nil {
+				// 	return err
+				// }
 				log.Printf("response identity '%s' to [%s] with id=%d\n", s.user, s.handle.dstMacAddr, eap.Id)
 			case layers.EAPTypeOTP:
 				s.updateStat(SrvStatRespMd5Chall)
 				if len(eap.TypeData) >= 17 {
-					seed := eap.TypeData[1:17]
-					if err := s.handle.SendResponseMD5Chall(eap.Id, seed, s.user, s.pass); err != nil {
-						return err
-					}
-					log.Printf("response md5-challange with seed=%v\n", seed)
+					// seed := eap.TypeData[1:17]
+					// if err := s.handle.SendResponseMD5Chall(eap.Id, seed, s.user, s.pass); err != nil {
+					// 	return err
+					// }
+					// log.Printf("response md5-challange with seed=%v\n", seed)
 				}
 			}
 		case layers.EAPCodeSuccess:
 			s.updateStat(SrvStatSuccess)
-			if len(eap.Contents) > 10 {
-				// if ok := s.getAdvertisement(eap.Contents); ok {
-				// 	log.Printf("------------- ADVERTISEMENT ------------------\n%s\n", s.advertising)
-				// 	log.Printf("------------------ END -----------------------\n")
-				// }
-				// go s.getRemoteAdvertisement()
-				pos := int(eap.Contents[9]) + 0x8B
-				if len(eap.Contents) >= pos+4 {
-					key := eap.Contents[pos : pos+4]
-					Symmetric(key)
-					s.echoKey = binary.BigEndian.Uint32(key)
-					s.echoNo = uint32(0x102b)
-					reNewIP(s.adapter)
-					s.crontab.ForceRegister("Echo", NewCronItem(func() {
-						s.updateStat(SrvStatKeepAlive)
-						s.handle.SendEchoPkt(s.echoNo, s.echoKey)
-						s.echoNo++
-					}, 30*time.Second))
-					log.Printf("sending keep-alive packet with no=%x, key=%x...\n", s.echoNo, s.echoKey)
-				}
-			}
-			log.Printf("A successful login, congraz!\n")
+			// 
 		case layers.EAPCodeFailure:
-			log.Printf("login failed, sorry.\n")
 			// 平方退避 0 1 4 9 16 25...
 			s.updateStat(SrvStatFailure)
 			interval := time.Duration(failcount*failcount) * time.Second
 			failcount++
+			log.Printf("Login failed, sorry. Next try on %vs\n", interval)
 			s.crontab.Delete("Echo")
 			time.Sleep(interval)
 			if err := s.handle.SendStartPkt(); err != nil {
@@ -186,37 +239,122 @@ func (s *Service) Run() error {
 	return nil
 }
 
-// func (s *Service) GetAdvertisement() (ret string) {
-// 	if len(s.advertising) == 0 {
-// 		return "广告被吃掉了，过几分钟再来吧 XD"
-// 	}
-// 	return s.advertising
-// }
+func (s *Service) handleUdp() error {
+	in, err := s.packetsUdp()
+	if err != nil {
+		return err
+	}
+	for packet := range in {
+		if s.isClosed {
+			break
+		}
+		if s.isStopped {
+			s.crontab.UpdateLastAccess("Echo", time.Now())
+			s.crontab.UpdateLastAccess("Monitor", time.Now())
+			continue
+		}
+		udp := packet.Layer(layers.LayerTypeUDP).(*layers.UDP)
+		if udp.SrcPort == 2000 {
+			s.updateStat(SrvStatKeepAlive)
+			// s.handle.SendEchoPkt(s.echoNo, s.echoKey)
+			// s.echoNo++
+		}
+	}
+	return nil
+}
 
-// func (s *Service) getAdvertisement(buf []byte) bool {
-// 	if len(buf) > 10 {
-// 		length := int(buf[9])
-// 		if length > 0 {
-// 			if ad, err := GbkToUtf8(bytes.TrimLeft(buf[10:length+10], "\n\r")); err != nil {
-// 				return false
-// 			} else {
-// 				s.advertising = string(ad)
-// 				return true
+// func (s *Service) packets() (<-chan gopacket.Packet, error) {
+// 	if s.chanPkts != nil {
+// 		return s.chanPkts, nil
+// 	}
+// 	s.chanPkts = make(chan gopacket.Packet, 1024)
+// 	go func() {
+// 		defer close(s.chanPkts)
+// 		// src from udp and ethernet
+// 		src := gopacket.NewPacketSource(s.handle.PcapHandle, layers.LayerTypeEthernet, layers.LayerTypeUDP)
+// 		in := src.Packets()
+// 		for packet := range in {
+// 			if s.isClosed {
+// 				break
 // 			}
+// 			pkt := packet.Layer(layers.LayerTypeEAP, layers.LayerTypeUDP)
+// 			if pkt == nil {
+// 				continue
+// 			}
+// 			s.chanPkts <- packet
 // 		}
-// 	}
-// 	return false
+// 	}()
+// 	return s.chanPkts, nil
 // }
 
-// func (s *Service) getRemoteAdvertisement() {
-// 	resp, err := http.Get(`https://raw.githubusercontent.com/tr3ee/go-rjsocks/master/ADVERTISEMENT`)
-// 	if err == nil && resp.StatusCode == 200 {
-// 		ads, err := ioutil.ReadAll(resp.Body)
-// 		if err == nil {
-// 			s.advertising = string(ads) + "\n" + s.advertising
-// 		}
-// 	}
-// }
+func (s *Service) initLogoff() error {
+	in, err := s.packets8021x()
+	if err != nil {
+		return err
+	}
+	for i := 2; i > 0; i-- {
+		err = s.handle.SendLogoffPkt()
+		if err != nil {
+			return err
+		}
+		// wait for response or 0.5s timeout
+		select {
+		case packet := <-in:
+			packet8021x := packet.Layer(layers.LayerTypeEAP).(*layers.EAP)
+			if packet8021x.Code == layers.EAPCodeFailure {
+				s.logOffBefore = true
+				continue
+			}
+		case <-time.After(500 * time.Millisecond):
+			continue
+		}
+	}
+	return nil
+}
+
+func (s *Service) Login() error {
+	err := s.handle.SendStartPkt()
+	if err != nil { return err }
+
+	in, err := s.packets8021x()
+	if err != nil { return err }
+
+	for i := 3; i > 0; i-- {
+		select {
+		case packet := <-in:
+			packet8021x := packet.Layer(layers.LayerTypeEAP).(*layers.Ethernet)
+			s.handle.dstMacAddr = packet8021x.SrcMAC
+			return s.handler8021x( packet )
+		case <-time.After(1 * time.Second):
+			continue
+		}
+	}
+	return nil
+}
+
+func (s *Service) Authenticate() error {
+	s.threadLock.Lock()
+	defer s.threadLock.Unlock()
+
+	err := s.initLogoff()
+	if err != nil {
+		return err
+	}
+
+	if s.logOffBefore {
+		s.logOffBefore = false
+		time.Sleep(2 * time.Second)
+	}
+
+	// logoff success, start auth
+	s.updateStat(SrvStatStart)
+	
+
+
+	// go 802.1x auth
+	// go udp auth ( udp for heart beat authorize )
+	return nil
+}
 
 func (s *Service) updateStat(stat SrvStat) {
 	s.crontab.UpdateLastAccess("Monitor", time.Now())
