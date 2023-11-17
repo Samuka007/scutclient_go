@@ -77,7 +77,7 @@ func (c *Crontab) Run() error {
 }
 
 func (c *Crontab) Close() {
-	c.m.Range(func(key, val interface{}) bool {
+	c.m.Range(func(key, _ interface{}) bool {
 		c.m.Delete(key)
 		return true
 	})

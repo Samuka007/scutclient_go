@@ -2,6 +2,7 @@ package scutclient_go
 
 import (
 	// "encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -227,6 +228,9 @@ func (s *Service) handle8021xPkt(packet gopacket.Packet) error {
 	case layers.EAPCodeSuccess:
 		s.updateStat(SrvStatSuccess)
 		s.retryTimes = AUTH_8021X_RECV_TIMES
+		time.Sleep(1 * time.Second)
+		// setting heartbeats
+		return s.handle.DrcomMiscStart()
 
 	default:
 		s.updateStat(SrvStatError)
@@ -315,7 +319,7 @@ func (s *Service) login() error {
 			}
 		}
 	}
-	return fmt.Errorf("No response")
+	return errors.New("No response.")
 }
 
 func (s *Service) Authenticate() error {

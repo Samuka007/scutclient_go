@@ -8,6 +8,8 @@ package scutclient_go
 import (
 	"bytes"
 	"crypto/md5"
+	"errors"
+	"fmt"
 	"net"
 
 	gopacket "github.com/google/gopacket"
@@ -40,6 +42,52 @@ var (
 	DrcomServerPort = 61440
 )
 
+type DrcomInfo struct {
+	ifc *IfcParse
+
+	LocalIP      net.IP
+	DrcomSvrAddr net.IP
+	DrcomDNS1    net.IP
+	DrcomDNS2    net.IP
+	DrcomSvrPort int
+}
+
+func (info *DrcomInfo) String() string {
+	return "==================================================\n" +
+		"DrcomInfo: \n" +
+		fmt.Sprintf("Device Name: %s", info.ifc.PcapName) +
+		fmt.Sprintf("Device Mac: %s", info.getLocalMac().String()) +
+		fmt.Sprintf("LocalIP: %s", info.LocalIP) +
+		fmt.Sprintf("DrcomSvrAddr: %s", info.DrcomSvrAddr) +
+		fmt.Sprintf("DrcomDNS1: %s", info.DrcomDNS1) +
+		fmt.Sprintf("DrcomDNS2: %s", info.DrcomDNS2) +
+		fmt.Sprintf("DrcomSvrPort: %d", info.DrcomSvrPort) +
+		"==================================================\n"
+}
+
+func (info *DrcomInfo) getLocalMac() net.HardwareAddr {
+	return info.ifc.NetTarget.HardwareAddr
+}
+
+func (info *DrcomInfo) SetDefault() {
+	info.DrcomSvrAddr = DrcomServerAddr
+	info.DrcomDNS1 = DrcomDNS1Addr
+	info.DrcomDNS2 = DrcomDNS2Addr
+	info.DrcomSvrPort = DrcomServerPort
+}
+
+func CreateDrcomInfoTemplate(idx int, parse *map[string]IfcParse) *DrcomInfo {
+	for ip, val := range *parse {
+		if val.index == idx {
+			return &DrcomInfo{
+				ifc:     &val,
+				LocalIP: net.ParseIP(ip),
+			}
+		}
+	}
+	return nil
+}
+
 // Handle class start
 
 // Handle definition
@@ -53,11 +101,31 @@ type Handle struct {
 	options                gopacket.SerializeOptions
 
 	// for drcom ( udp ) auth
-	SvrAddr net.IP
-	SvrPort int
+	udpAuthConn *net.UDPConn
 }
 
-// constructor
+// always use this function to create a handle
+func HandleFromInfo(info *DrcomInfo) (*Handle, error) {
+	handler, err := pcap.OpenLive(info.ifc.PcapName, 1024, false, pcap.BlockForever)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.DialUDP("udp", &net.UDPAddr{IP: info.LocalIP}, &net.UDPAddr{IP: info.DrcomSvrAddr, Port: info.DrcomSvrPort})
+	if err != nil {
+		return nil, err
+	}
+	return &Handle{
+		PcapHandle: handler,
+		srcMacAddr: info.getLocalMac(),
+		dstMacAddr: MultiCastAddr,
+		buffer:     gopacket.NewSerializeBuffer(),
+		options:    gopacket.SerializeOptions{FixLengths: false, ComputeChecksums: true},
+
+		udpAuthConn: conn,
+	}, nil
+}
+
+// nolonger used
 func NewHandle(dev *pcap.Interface, srcMacAddr net.HardwareAddr) (*Handle, error) {
 	handler, err := pcap.OpenLive(dev.Name, 1024, false, pcap.BlockForever)
 	if err != nil {
@@ -189,4 +257,14 @@ func (h *Handle) SendStartPkt() error {
 		return err
 	}
 	return nil
+}
+
+var startPkt = []byte{0x07, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00}
+
+func (h *Handle) DrcomMiscStart() error {
+	length, err := h.udpAuthConn.Write(startPkt)
+	if length != len(startPkt) {
+		return errors.New("DrcomMiscStart: Write length error")
+	}
+	return err
 }
