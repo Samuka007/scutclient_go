@@ -33,15 +33,28 @@ var (
 		0xd0, 0xf8, 0x00, 0x00, 0x03, 0x88, 0x8e}
 )
 
+var (
+	DrcomServerAddr = net.IPv4(202, 38, 210, 131)
+	DrcomDNS1Addr   = net.IPv4(222, 201, 130, 30)
+	DrcomDNS2Addr   = net.IPv4(222, 201, 130, 33)
+	DrcomServerPort = 61440
+)
+
 // Handle class start
 
 // Handle definition
 type Handle struct {
-	PcapHandle             *pcap.Handle
+	PcapHandle *pcap.Handle
+
+	// for 802.1x auth
 	srcMacAddr, dstMacAddr net.HardwareAddr
 	svrMacAddr             net.HardwareAddr
 	buffer                 gopacket.SerializeBuffer
 	options                gopacket.SerializeOptions
+
+	// for drcom ( udp ) auth
+	SvrAddr net.IP
+	SvrPort int
 }
 
 // constructor

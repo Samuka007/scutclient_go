@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +24,10 @@ const (
 	SrvStatFailure
 	SrvStatKeepAlive
 	SrvStatError
+)
+
+const (
+	AUTH_8021X_RECV_TIMES = 3
 )
 
 func (s SrvStat) String() string {
@@ -59,6 +65,7 @@ type Service struct {
 	// chanPkts		chan gopacket.Packet
 	threadLock   sync.Mutex
 	crontab      *Crontab
+	retryTimes   int
 	isClosed     bool
 	isStopped    bool
 	logOffBefore bool
@@ -140,6 +147,51 @@ func getSrcMac(packet gopacket.Packet) net.HardwareAddr {
 	return packet.Layer(layers.LayerTypeEthernet).(*layers.Ethernet).SrcMAC
 }
 
+func DrcomEAPErrParse(data []byte) string {
+	str := string(data)
+	if strings.HasPrefix(str, "userid error") {
+		errcode, _ := strconv.Atoi(str[12:])
+		switch errcode {
+		case 1:
+			return "Account does not exist."
+		case 2, 3:
+			return "Username or password invalid."
+		case 4:
+			return "This account might be expended."
+		default:
+			return str
+		}
+	} else if strings.HasPrefix(str, "Authentication Fail ErrCode=") {
+		errcode, _ := strconv.Atoi(str[27:])
+		switch errcode {
+		case 0:
+			return "Username or password invalid."
+		case 5:
+			return "This account is suspended."
+		case 9:
+			return "This account might be expended."
+		case 11:
+			return "You are not allowed to perform a radius authentication."
+		case 16:
+			// timeNotAllowed = 1
+			return "You are not allowed to access the internet now."
+		case 30, 63:
+			return "No more time available for this account."
+		default:
+			return str
+		}
+	} else if strings.HasPrefix(str, "AdminReset") {
+		return str
+	} else if strings.Contains(str, "Mac, IP, NASip, PORT") {
+		return "You are not allowed to login using current IP/MAC address."
+	} else if strings.Contains(str, "flowover") {
+		return "Data usage has reached the limit."
+	} else if strings.Contains(str, "In use") {
+		return "This account is in use."
+	}
+	return ""
+}
+
 func (s *Service) handle8021xPkt(packet gopacket.Packet) error {
 	eap := packet.Layer(layers.LayerTypeEAP).(*layers.EAP)
 	switch eap.Code {
@@ -154,13 +206,13 @@ func (s *Service) handle8021xPkt(packet gopacket.Packet) error {
 		// MD5 challenge
 		case layers.EAPTypeOTP:
 			s.updateStat(SrvStatRespMd5Chall)
-			return s.handle.SendResponseMD5Chall(eap.Id, packet.Data(), s.user, s.pass)
+			return s.handle.SendResponseMD5Chall(eap.Id, eap.Contents, s.user, s.pass)
 
 		// Notification
 		case layers.EAPTypeNotification:
-			if err := ParseDrcomErr(packet.Data()); err != nil {
+			if err := DrcomEAPErrParse(eap.Contents); err != "" {
 				s.updateStat(SrvStatError)
-				return err
+				return fmt.Errorf(err)
 			}
 			// log info notification
 		}
@@ -174,8 +226,8 @@ func (s *Service) handle8021xPkt(packet gopacket.Packet) error {
 		// return fmt.Errorf("Reconnection failed. Server: %d", eap.Type)
 	case layers.EAPCodeSuccess:
 		s.updateStat(SrvStatSuccess)
-		// go heart beat
-		// udp parrallel heart beat auth start
+		s.retryTimes = AUTH_8021X_RECV_TIMES
+
 	default:
 		s.updateStat(SrvStatError)
 		return fmt.Errorf("Unknown EAP Code %d", eap.Code)
