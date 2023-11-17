@@ -7,6 +7,7 @@ package scutclient_go
 
 import (
 	"bytes"
+	"crypto/md5"
 	"net"
 
 	gopacket "github.com/google/gopacket"
@@ -38,6 +39,7 @@ var (
 type Handle struct {
 	PcapHandle             *pcap.Handle
 	srcMacAddr, dstMacAddr net.HardwareAddr
+	svrMacAddr             net.HardwareAddr
 	buffer                 gopacket.SerializeBuffer
 	options                gopacket.SerializeOptions
 }
@@ -97,6 +99,60 @@ func (h *Handle) SendLogoffPkt() error {
 	return nil
 }
 
+func (h *Handle) SendResponseIdentity(id uint8, identity []byte) error {
+	eth := layers.Ethernet{
+		SrcMAC:       h.srcMacAddr,
+		DstMAC:       h.dstMacAddr,
+		EthernetType: layers.EthernetTypeEAPOL,
+	}
+	eapol := layers.EAPOL{
+		Version: 0x01,
+		Type:    layers.EAPOLTypeEAP,
+		Length:  uint16(0x10),
+	}
+	eap := layers.EAP{
+		Code:     layers.EAPCodeResponse,
+		Id:       id,
+		Type:     layers.EAPTypeIdentity,
+		TypeData: identity,
+		Length:   uint16(0x10),
+	}
+	if err := h.send(&eth, &eapol, &eap, &fillLayer); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (h *Handle) SendResponseMD5Chall(id uint8, salt, user, pass []byte) error {
+	plain := []byte{id}
+	plain = append(plain, pass...)
+	plain = append(plain, salt[:0x10]...)
+	cipher := md5.Sum(plain)
+	data := append([]byte{uint8(len(cipher))}, cipher[:]...)
+	data = append(data, user...)
+	eth := layers.Ethernet{
+		SrcMAC:       h.srcMacAddr,
+		DstMAC:       h.dstMacAddr,
+		EthernetType: layers.EthernetTypeEAPOL,
+	}
+	eapol := layers.EAPOL{
+		Version: 0x01,
+		Type:    layers.EAPOLTypeEAP,
+		Length:  uint16(5 + len(data)),
+	}
+	eap := layers.EAP{
+		Code:     layers.EAPCodeResponse,
+		Id:       id,
+		Type:     layers.EAPTypeOTP,
+		TypeData: data,
+		Length:   eapol.Length,
+	}
+	if err := h.send(&eth, &eapol, &eap, &fillLayer); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (h *Handle) SendStartPkt() error {
 	if h.dstMacAddr == nil {
 		h.dstMacAddr = MultiCastAddr
@@ -111,7 +167,7 @@ func (h *Handle) SendStartPkt() error {
 		DstMAC:       h.dstMacAddr,
 		EthernetType: layers.EthernetTypeEAPOL,
 	}
-	
+
 	eapol := layers.EAPOL{
 		Version: 0x01,
 		Type:    layers.EAPOLTypeStart,

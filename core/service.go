@@ -1,9 +1,10 @@
 package scutclient_go
 
 import (
-	"encoding/binary"
+	// "encoding/binary"
 	"fmt"
 	"log"
+	"net"
 	"sync"
 	"time"
 
@@ -51,16 +52,16 @@ type Service struct {
 	echoNo, echoKey uint32
 	advertising     string
 	// 8021x auth pkts
-	pkt8021x        chan gopacket.Packet
+	pkt8021x chan gopacket.Packet
 	// udp auth pkts
-	pktUdp			chan gopacket.Packet
+	pktUdp chan gopacket.Packet
 	// global pkts
 	// chanPkts		chan gopacket.Packet
-	threadLock      sync.Mutex
-	crontab         *Crontab
-	isClosed        bool
-	isStopped       bool
-	logOffBefore	bool
+	threadLock   sync.Mutex
+	crontab      *Crontab
+	isClosed     bool
+	isStopped    bool
+	logOffBefore bool
 }
 
 func NewService(usr, pass, dev, adap string) (*Service, error) {
@@ -135,107 +136,55 @@ func (s *Service) packetsUdp() (<-chan gopacket.Packet, error) {
 	return s.pktUdp, nil
 }
 
-func (s *Service) handler8021x( packet gopacket.Packet ) error {
-	if s.isClosed {
-		return nil
-	}
-	if s.isStopped {
-		s.crontab.UpdateLastAccess("Echo", time.Now())
-		s.crontab.UpdateLastAccess("Monitor", time.Now())
-	}
+func getSrcMac(packet gopacket.Packet) net.HardwareAddr {
+	return packet.Layer(layers.LayerTypeEthernet).(*layers.Ethernet).SrcMAC
+}
+
+func (s *Service) handle8021xPkt(packet gopacket.Packet) error {
 	eap := packet.Layer(layers.LayerTypeEAP).(*layers.EAP)
 	switch eap.Code {
 	case layers.EAPCodeRequest:
 		switch eap.Type {
+
+		// Identity
 		case layers.EAPTypeIdentity:
 			s.updateStat(SrvStatRespIdentity)
-			eth := packet.Layer(layers.LayerTypeEthernet).(*layers.Ethernet)
-			s.handle.SetDstMacAddr(eth.SrcMAC)
-			// if err := s.handle.SendResponseIdentity(eap.Id, s.user); err != nil {
-			// 	return err
-			// }
-			log.Printf("response identity '%s' to [%s] with id=%d\n", s.user, s.handle.dstMacAddr, eap.Id)
+			return s.handle.SendResponseIdentity(eap.Id, s.user)
+
+		// MD5 challenge
 		case layers.EAPTypeOTP:
 			s.updateStat(SrvStatRespMd5Chall)
-			if len(eap.TypeData) >= 17 {
-				// seed := eap.TypeData[1:17]
-				// if err := s.handle.SendResponseMD5Chall(eap.Id, seed, s.user, s.pass); err != nil {
-				// 	return err
-				// }
-				// log.Printf("response md5-challange with seed=%v\n", seed)
+			return s.handle.SendResponseMD5Chall(eap.Id, packet.Data(), s.user, s.pass)
+
+		// Notification
+		case layers.EAPTypeNotification:
+			if err := ParseDrcomErr(packet.Data()); err != nil {
+				s.updateStat(SrvStatError)
+				return err
 			}
+			// log info notification
 		}
+	case layers.EAPCodeFailure:
+		s.updateStat(SrvStatFailure)
+		// if retry time > 0
+		// retry time--
+		// set status retry
+		// else
+		// set status failure
+		// return fmt.Errorf("Reconnection failed. Server: %d", eap.Type)
 	case layers.EAPCodeSuccess:
 		s.updateStat(SrvStatSuccess)
-		// 
-	// case layers.EAPCodeFailure:
-	// 	// 平方退避 0 1 4 9 16 25...
-	// 	s.updateStat(SrvStatFailure)
-	// 	interval := time.Duration(failcount*failcount) * time.Second
-	// 	failcount++
-	// 	log.Printf("Login failed, sorry. Next try on %vs\n", interval)
-	// 	s.crontab.Delete("Echo")
-	// 	time.Sleep(interval)
-	// 	if err := s.handle.SendStartPkt(); err != nil {
-	// 		return err
-	// 	}
+		// go heart beat
+		// udp parrallel heart beat auth start
+	default:
+		s.updateStat(SrvStatError)
+		return fmt.Errorf("Unknown EAP Code %d", eap.Code)
 	}
 	return nil
 }
 
-func (s *Service) handle8021x() error {
-	in, err := s.packets8021x()
-	failcount := int64(0)
-	if err != nil {
-		return err
-	}
-	for packet := range in {
-		if s.isClosed {
-			break
-		}
-		if s.isStopped {
-			s.crontab.UpdateLastAccess("Echo", time.Now())
-			s.crontab.UpdateLastAccess("Monitor", time.Now())
-			continue
-		}
-		eap := packet.Layer(layers.LayerTypeEAP).(*layers.EAP)
-		switch eap.Code {
-		case layers.EAPCodeRequest:
-			switch eap.Type {
-			case layers.EAPTypeIdentity:
-				s.updateStat(SrvStatRespIdentity)
-				eth := packet.Layer(layers.LayerTypeEthernet).(*layers.Ethernet)
-				s.handle.SetDstMacAddr(eth.SrcMAC)
-				// if err := s.handle.SendResponseIdentity(eap.Id, s.user); err != nil {
-				// 	return err
-				// }
-				log.Printf("response identity '%s' to [%s] with id=%d\n", s.user, s.handle.dstMacAddr, eap.Id)
-			case layers.EAPTypeOTP:
-				s.updateStat(SrvStatRespMd5Chall)
-				if len(eap.TypeData) >= 17 {
-					// seed := eap.TypeData[1:17]
-					// if err := s.handle.SendResponseMD5Chall(eap.Id, seed, s.user, s.pass); err != nil {
-					// 	return err
-					// }
-					// log.Printf("response md5-challange with seed=%v\n", seed)
-				}
-			}
-		case layers.EAPCodeSuccess:
-			s.updateStat(SrvStatSuccess)
-			// 
-		case layers.EAPCodeFailure:
-			// 平方退避 0 1 4 9 16 25...
-			s.updateStat(SrvStatFailure)
-			interval := time.Duration(failcount*failcount) * time.Second
-			failcount++
-			log.Printf("Login failed, sorry. Next try on %vs\n", interval)
-			s.crontab.Delete("Echo")
-			time.Sleep(interval)
-			if err := s.handle.SendStartPkt(); err != nil {
-				return err
-			}
-		}
-	}
+func (s *Service) proxy8021x() error {
+
 	return nil
 }
 
@@ -263,30 +212,6 @@ func (s *Service) handleUdp() error {
 	return nil
 }
 
-// func (s *Service) packets() (<-chan gopacket.Packet, error) {
-// 	if s.chanPkts != nil {
-// 		return s.chanPkts, nil
-// 	}
-// 	s.chanPkts = make(chan gopacket.Packet, 1024)
-// 	go func() {
-// 		defer close(s.chanPkts)
-// 		// src from udp and ethernet
-// 		src := gopacket.NewPacketSource(s.handle.PcapHandle, layers.LayerTypeEthernet, layers.LayerTypeUDP)
-// 		in := src.Packets()
-// 		for packet := range in {
-// 			if s.isClosed {
-// 				break
-// 			}
-// 			pkt := packet.Layer(layers.LayerTypeEAP, layers.LayerTypeUDP)
-// 			if pkt == nil {
-// 				continue
-// 			}
-// 			s.chanPkts <- packet
-// 		}
-// 	}()
-// 	return s.chanPkts, nil
-// }
-
 func (s *Service) initLogoff() error {
 	in, err := s.packets8021x()
 	if err != nil {
@@ -312,24 +237,33 @@ func (s *Service) initLogoff() error {
 	return nil
 }
 
-func (s *Service) Login() error {
+func (s *Service) login() error {
 	err := s.handle.SendStartPkt()
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 
 	in, err := s.packets8021x()
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 
 	for i := 3; i > 0; i-- {
 		select {
-		case packet := <-in:
-			packet8021x := packet.Layer(layers.LayerTypeEAP).(*layers.Ethernet)
-			s.handle.dstMacAddr = packet8021x.SrcMAC
-			return s.handler8021x( packet )
+
+		case pkt := <-in:
+			s.handle.svrMacAddr = getSrcMac(pkt)
+			// good to start main auth
+			return s.handle8021xPkt(pkt)
+
 		case <-time.After(1 * time.Second):
-			continue
+			err := s.handle.SendStartPkt()
+			if err != nil {
+				return err
+			}
 		}
 	}
-	return nil
+	return fmt.Errorf("No response")
 }
 
 func (s *Service) Authenticate() error {
@@ -348,8 +282,6 @@ func (s *Service) Authenticate() error {
 
 	// logoff success, start auth
 	s.updateStat(SrvStatStart)
-	
-
 
 	// go 802.1x auth
 	// go udp auth ( udp for heart beat authorize )
